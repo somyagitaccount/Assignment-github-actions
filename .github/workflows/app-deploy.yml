@@ -1,9 +1,8 @@
-# .github/workflows/app-deploy.yml
 name: Java App Build & Deploy (ECR + Helm)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - 'Application/**'
       - 'helm-chart/**'
@@ -16,13 +15,13 @@ env:
   IMAGE_TAG: "1.0.0"
 
 jobs:
-  build_test:
-    name: Build Java App
+  build_and_package:
+    name: Build and Package JAR
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
 
-      - name: Set up JDK 17
+      - name: Set up JDK 17 with Maven cache
         uses: actions/setup-java@v3
         with:
           java-version: '17'
@@ -30,42 +29,19 @@ jobs:
           cache: maven
 
       - name: Build with Maven
-        run: mvn -B clean package
+        run: mvn clean package --batch-mode --no-transfer-progress
         working-directory: Application
 
-  publish_job:
-    name: Package and Upload JAR
-    runs-on: ubuntu-latest
-    needs: build_test
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v3
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Run tests and verify build
-        run: mvn --batch-mode verify
-        working-directory: Application
-
-      - name: Copy JAR to staging
-        run: |
-          mkdir -p staging/target
-          cp Application/target/${{ env.JAR_NAME }} staging/target/
-
-      - name: Upload artifact
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: staging
+          path: Application/target/${{ env.JAR_NAME }}
 
-  ecr_publish:
-    name: Build and Push Docker Image
+  docker_build_and_push:
+    name: Docker Build & Push to ECR
     runs-on: ubuntu-latest
-    needs: publish_job
-    environment: prod
+    needs: build_and_package
     steps:
       - uses: actions/checkout@v3
 
@@ -73,13 +49,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: staging
+          path: Application/target
 
-      - name: Restore JAR to expected target location
-        run: |
-          mkdir -p Application/target
-          cp staging/target/${{ env.JAR_NAME }} Application/target/
-          
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -90,23 +61,17 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker image
+      - name: Build & Push Docker image
         run: |
-          docker build -t ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
-            -f Application/Dockerfile Application
-
-      - name: Push Docker image to ECR
-        run: |
-          docker push ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          IMAGE=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+          docker build -t $IMAGE -f Application/Dockerfile Application
+          docker push $IMAGE
 
   helm_deploy:
-    name: Deploy to EKS using Helm
+    name: Helm Deploy to EKS
     runs-on: ubuntu-latest
-    needs: ecr_publish
+    needs: docker_build_and_push
     environment: prod
-    env:
-      IMAGE_TAG: "1.0.0"
-
     steps:
       - uses: actions/checkout@v3
 
@@ -118,20 +83,18 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Set up kubeconfig for EKS
-        run: |
-          aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_NAME }} --region ${{ vars.AWS_REGION }}
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_NAME }} --region ${{ vars.AWS_REGION }}
 
       - name: Install Helm
-        run: |
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+        run: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
       - name: Lint Helm chart
-        run: helm lint ./helm-chart
+        run: helm lint ./helm-chart --strict
 
       - name: Deploy with Helm
         run: |
           helm upgrade --install greet ./helm-chart \
             --namespace default \
             --set image.repository=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }} \
-            --set image.tag=${IMAGE_TAG} \
+            --set image.tag=${{ env.IMAGE_TAG }} \
             --set image.pullPolicy=Always
