@@ -42,6 +42,7 @@ jobs:
     name: Docker Build & Push to ECR
     runs-on: ubuntu-latest
     needs: build_and_package
+    environment: prod
     steps:
       - uses: actions/checkout@v3
 
